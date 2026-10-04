@@ -1,0 +1,342 @@
+import Groq from "groq-sdk";
+import dotenv from "dotenv";
+import { Command } from "commander";
+import { listFiles, readFile, writeFile, editFile, runCommand, } from "./tools.js";
+dotenv.config();
+const apiKey = process.env.GROQ_API_KEY;
+if (!apiKey) {
+    throw new Error("GROQ_API_KEY is not set in .env");
+}
+const groq = new Groq({
+    apiKey,
+});
+const tools = [
+    {
+        type: "function",
+        function: {
+            name: "list_files",
+            description: "List files and directories inside the current project.",
+            parameters: {
+                type: "object",
+                properties: {
+                    directory: {
+                        type: "string",
+                        description: "Directory to list. Defaults to the project root.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "read_file",
+            description: "Read the complete contents of a file.",
+            parameters: {
+                type: "object",
+                properties: {
+                    filePath: {
+                        type: "string",
+                        description: "Path of the file to read.",
+                    },
+                },
+                required: ["filePath"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "write_file",
+            description: "Create a file or completely replace its contents.",
+            parameters: {
+                type: "object",
+                properties: {
+                    filePath: {
+                        type: "string",
+                        description: "Path of the file.",
+                    },
+                    content: {
+                        type: "string",
+                        description: "Complete content to write.",
+                    },
+                },
+                required: ["filePath", "content"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "edit_file",
+            description: "Replace an exact piece of text inside an existing file.",
+            parameters: {
+                type: "object",
+                properties: {
+                    filePath: {
+                        type: "string",
+                        description: "Path of the file.",
+                    },
+                    oldText: {
+                        type: "string",
+                        description: "Exact existing text.",
+                    },
+                    newText: {
+                        type: "string",
+                        description: "Replacement text.",
+                    },
+                },
+                required: [
+                    "filePath",
+                    "oldText",
+                    "newText",
+                ],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "run_command",
+            description: "Run a terminal command inside the current project.",
+            parameters: {
+                type: "object",
+                properties: {
+                    command: {
+                        type: "string",
+                        description: "Terminal command to execute.",
+                    },
+                },
+                required: ["command"],
+            },
+        },
+    },
+];
+async function executeTool(name, args) {
+    console.log(`\n[tool] ${name}`);
+    switch (name) {
+        case "list_files":
+            return await listFiles(args.directory ?? ".");
+        case "read_file":
+            return await readFile(args.filePath);
+        case "write_file":
+            return await writeFile(args.filePath, args.content);
+        case "edit_file":
+            return await editFile(args.filePath, args.oldText, args.newText);
+        case "run_command":
+            return await runCommand(args.command);
+        default:
+            throw new Error(`Unknown tool: ${name}`);
+    }
+}
+/*
+  Calls Groq with retry support.
+
+  Maximum attempts = 5.
+
+  If Groq fails:
+  1. We print the error.
+  2. We wait.
+  3. We tell the LLM that the previous attempt failed.
+  4. We try again.
+*/
+async function callGroqWithRetry(messages) {
+    const maxRetries = 5;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`\n[LLM] Attempt ${attempt}/${maxRetries}`);
+            const response = await groq.chat.completions.create({
+                model: "openai/gpt-oss-120b",
+                messages,
+                tools,
+                tool_choice: "auto",
+                temperature: 0,
+            });
+            return response;
+        }
+        catch (error) {
+            const errorMessage = error?.message ??
+                String(error);
+            console.error(`\n[LLM ERROR] Attempt ${attempt}/${maxRetries}`);
+            console.error(errorMessage);
+            /*
+              If this was the last attempt,
+              stop completely.
+            */
+            if (attempt === maxRetries) {
+                throw new Error(`LLM failed after ${maxRetries} attempts: ${errorMessage}`);
+            }
+            /*
+              Tell the LLM what happened before
+              making the next attempt.
+            */
+            messages.push({
+                role: "user",
+                content: `
+The previous LLM request failed.
+
+Error:
+${errorMessage}
+
+The request did not complete successfully.
+
+Please retry the task.
+Do not assume that the failed operation happened.
+Check the current project state with tools if necessary.
+Continue from whatever work has actually been completed.
+`,
+            });
+            /*
+              Simple exponential backoff:
+      
+              attempt 1 → wait 2 seconds
+              attempt 2 → wait 4 seconds
+              attempt 3 → wait 6 seconds
+              attempt 4 → wait 8 seconds
+            */
+            const delay = attempt * 2000;
+            console.log(`[LLM] Retrying in ${delay / 1000}s...`);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+    }
+    throw new Error("Unexpected retry failure.");
+}
+export async function runAgent(prompt) {
+    console.log("Agent:", prompt);
+    const messages = [
+        {
+            role: "system",
+            content: `
+You are an autonomous terminal coding agent.
+
+You work directly on the user's project.
+
+Rules:
+
+- Inspect the project before making changes.
+- Use tools instead of merely describing code.
+- Read relevant files before editing them.
+- Make the requested changes yourself.
+- Run commands when necessary to verify your work.
+- If a command produces an error, inspect the error and fix it.
+- Continue working until the user's task is complete.
+- Do not claim that you created or modified something unless you actually used a tool to do it.
+
+IMPORTANT FILE MODIFICATION RULES:
+
+- Never overwrite an existing file unless the user explicitly asks you to completely replace it.
+- Before modifying an existing file, always read it first.
+- Use edit_file when modifying an existing file.
+- Use write_file only when creating a new file.
+- If write_file reports that a file already exists, use read_file and then edit_file.
+- Preserve existing code and configuration that is unrelated to the user's request.
+- When adding something to an existing file, make the smallest necessary change.
+- Never remove existing environment variables from .env unless the user explicitly asks you to remove them.
+- Never remove existing dependencies, configuration, routes, functions, or code unless the user explicitly asks for their removal.
+- When adding an environment variable, preserve all existing environment variables.
+- When modifying package.json, preserve existing dependencies and scripts unless the user explicitly asks to change them.
+- Do not recreate an existing project from scratch.
+- Prefer incremental modifications over replacing complete files.
+
+For every task:
+
+1. Inspect the relevant project files.
+2. Understand the existing implementation.
+3. Make the smallest necessary changes.
+4. Run relevant commands/tests.
+5. Inspect errors if anything fails.
+6. Fix the errors.
+7. Verify the final result.
+`,
+        },
+        {
+            role: "user",
+            content: prompt,
+        },
+    ];
+    const maxIterations = 15;
+    for (let iteration = 0; iteration < maxIterations; iteration++) {
+        /*
+          Instead of directly calling Groq,
+          we call our retry-enabled function.
+        */
+        const response = await callGroqWithRetry(messages);
+        const message = response.choices[0]?.message;
+        if (!message) {
+            throw new Error("Groq returned no message.");
+        }
+        /*
+          Save the assistant message
+          into the conversation.
+        */
+        messages.push(message);
+        /*
+          If there are no tool calls,
+          the agent is finished.
+        */
+        if (!message.tool_calls ||
+            message.tool_calls.length === 0) {
+            console.log("\nGroq:\n");
+            console.log(message.content ?? "");
+            return;
+        }
+        /*
+          Execute every tool requested
+          by the LLM.
+        */
+        for (const toolCall of message.tool_calls) {
+            const functionName = toolCall.function.name;
+            let args;
+            try {
+                args = JSON.parse(toolCall.function.arguments);
+            }
+            catch {
+                args = {};
+            }
+            let result;
+            try {
+                result =
+                    await executeTool(functionName, args);
+            }
+            catch (error) {
+                /*
+                  IMPORTANT:
+        
+                  The tool itself failed.
+        
+                  Instead of crashing the agent,
+                  we send the error back to the LLM.
+                */
+                result = {
+                    error: error?.message ??
+                        String(error),
+                    is_error: true,
+                };
+            }
+            /*
+              Send the tool result back to Groq.
+      
+              Now Groq knows:
+      
+              "I called write_file.
+               It failed because X."
+      
+              So it can decide what to do next.
+            */
+            messages.push({
+                role: "tool",
+                tool_call_id: toolCall.id,
+                name: functionName,
+                content: JSON.stringify(result),
+            });
+        }
+    }
+    console.log("\nAgent stopped: maximum iterations reached.");
+}
+export const agentCommand = new Command("agent")
+    .description("Run the coding agent")
+    .requiredOption("-p, --prompt <prompt>", "Prompt for the agent")
+    .action(async (options) => {
+    await runAgent(options.prompt);
+});
+//# sourceMappingURL=agent.js.map
