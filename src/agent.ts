@@ -12,15 +12,34 @@ import {
 
 dotenv.config();
 
+/**
+ * Enable detailed request/tool tracing by setting DEBUG_LLM=true in .env.
+ * Be careful: tool results can contain source code, file contents, or secrets.
+ */
+const DEBUG_LLM = process.env.DEBUG_LLM === "true";
+
+function debugLog(label: string, data: unknown): void {
+  if (!DEBUG_LLM) return;
+
+  console.log(`\n========== ${label} ==========`);
+
+  console.dir(data, {
+    depth: null,
+    colors: true,
+    maxArrayLength: null,
+    maxStringLength: null,
+  });
+
+  console.log(`========== END ${label} ==========\n`);
+}
+
 const apiKey = process.env.GROQ_API_KEY;
 
 if (!apiKey) {
   throw new Error("GROQ_API_KEY is not set in .env");
 }
 
-const groq = new Groq({
-  apiKey,
-});
+const groq = new Groq({ apiKey });
 
 const tools = [
   {
@@ -41,13 +60,11 @@ const tools = [
       },
     },
   },
-
   {
     type: "function" as const,
     function: {
       name: "read_file",
-      description:
-        "Read the complete contents of a file.",
+      description: "Read the complete contents of a file.",
       parameters: {
         type: "object",
         properties: {
@@ -60,13 +77,11 @@ const tools = [
       },
     },
   },
-
   {
     type: "function" as const,
     function: {
       name: "write_file",
-      description:
-        "Create a file or completely replace its contents.",
+      description: "Create a file or completely replace its contents.",
       parameters: {
         type: "object",
         properties: {
@@ -83,7 +98,6 @@ const tools = [
       },
     },
   },
-
   {
     type: "function" as const,
     function: {
@@ -106,28 +120,23 @@ const tools = [
             description: "Replacement text.",
           },
         },
-        required: [
-          "filePath",
-          "oldText",
-          "newText",
-        ],
+        required: ["filePath", "oldText", "newText"],
       },
     },
   },
-
   {
     type: "function" as const,
     function: {
       name: "run_command",
       description:
-        "Run a terminal command inside the current project.",
+        'Execute one shell command as a single string, for example "pwd" or "ls -la". Do not pass command as an array.',
       parameters: {
         type: "object",
         properties: {
           command: {
             type: "string",
             description:
-              "Terminal command to execute.",
+              'A single shell command string, e.g. "pwd". Never use an array.',
           },
         },
         required: ["command"],
@@ -138,110 +147,92 @@ const tools = [
 
 async function executeTool(
   name: string,
-  args: any
-) {
+  args: any,
+): Promise<unknown> {
   console.log(`\n[tool] ${name}`);
+  debugLog("TOOL ARGUMENTS", { name, arguments: args });
 
   switch (name) {
     case "list_files":
-      return await listFiles(
-        args.directory ?? "."
-      );
+      return await listFiles(args.directory ?? ".");
 
     case "read_file":
-      return await readFile(
-        args.filePath
-      );
+      return await readFile(args.filePath);
 
     case "write_file":
-      return await writeFile(
-        args.filePath,
-        args.content
-      );
+      return await writeFile(args.filePath, args.content);
 
     case "edit_file":
       return await editFile(
         args.filePath,
         args.oldText,
-        args.newText
+        args.newText,
       );
 
     case "run_command":
-      return await runCommand(
-        args.command
-      );
+      return await runCommand(args.command);
 
     default:
-      throw new Error(
-        `Unknown tool: ${name}`
-      );
+      throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-
-/*
-  Calls Groq with retry support.
-
-  Maximum attempts = 5.
-
-  If Groq fails:
-  1. We print the error.
-  2. We wait.
-  3. We tell the LLM that the previous attempt failed.
-  4. We try again.
-*/
-async function callGroqWithRetry(
-  messages: any[]
-) {
+/**
+ * Calls Groq with retry support.
+ * Each successful API response is logged when DEBUG_LLM=true.
+ */
+async function callGroqWithRetry(messages: any[]) {
   const maxRetries = 5;
 
-  for (
-    let attempt = 1;
-    attempt <= maxRetries;
-    attempt++
-  ) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(
-        `\n[LLM] Attempt ${attempt}/${maxRetries}`
-      );
+      console.log(`\n[LLM] Attempt ${attempt}/${maxRetries}`);
 
-      const response =
-        await groq.chat.completions.create({
-          model: "openai/gpt-oss-120b",
-          messages,
-          tools,
-          tool_choice: "auto",
-          temperature: 0,
-        });
+      const startedAt = Date.now();
+
+      const response = await groq.chat.completions.create({
+        model: "openai/gpt-oss-120b",
+        messages,
+        tools,
+        tool_choice: "auto",
+        temperature: 0,
+      });
+
+      const message = response.choices[0]?.message;
+
+      debugLog("LLM RESPONSE", {
+        durationMs: Date.now() - startedAt,
+        content: message?.content,
+        tool_calls: message?.tool_calls?.map((call) => ({
+          id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments,
+        })),
+        finish_reason: response.choices[0]?.finish_reason,
+      });
 
       return response;
-
-    } catch (error: any) {
-
+    } catch (error: unknown) {
       const errorMessage =
-        error?.message ??
-        String(error);
+        error instanceof Error ? error.message : String(error);
 
       console.error(
-        `\n[LLM ERROR] Attempt ${attempt}/${maxRetries}`
+        `\n[LLM ERROR] Attempt ${attempt}/${maxRetries}`,
       );
-
       console.error(errorMessage);
 
-      /*
-        If this was the last attempt,
-        stop completely.
-      */
+      debugLog("LLM REQUEST FAILURE", {
+        attempt,
+        maxRetries,
+        error: errorMessage,
+      });
+
       if (attempt === maxRetries) {
         throw new Error(
-          `LLM failed after ${maxRetries} attempts: ${errorMessage}`
+          `LLM failed after ${maxRetries} attempts: ${errorMessage}`,
         );
       }
 
-      /*
-        Tell the LLM what happened before
-        making the next attempt.
-      */
       messages.push({
         role: "user",
         content: `
@@ -251,63 +242,34 @@ Error:
 ${errorMessage}
 
 The request did not complete successfully.
-
-Please retry the task.
 Do not assume that the failed operation happened.
 Check the current project state with tools if necessary.
 Continue from whatever work has actually been completed.
 `,
       });
 
-      /*
-        Simple exponential backoff:
+      const delay = attempt * 2000;
+      console.log(`[LLM] Retrying in ${delay / 1000}s...`);
 
-        attempt 1 → wait 2 seconds
-        attempt 2 → wait 4 seconds
-        attempt 3 → wait 6 seconds
-        attempt 4 → wait 8 seconds
-      */
-
-      const delay =
-        attempt * 2000;
-
-      console.log(
-        `[LLM] Retrying in ${delay / 1000}s...`
-      );
-
-      await new Promise(
-        (resolve) =>
-          setTimeout(resolve, delay)
-      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
 
-  throw new Error(
-    "Unexpected retry failure."
-  );
+  throw new Error("Unexpected retry failure.");
 }
 
-
-export async function runAgent(
-  prompt: string
-) {
-  console.log(
-    "Agent:",
-    prompt
-  );
+export async function runAgent(prompt: string) {
+  console.log("Agent:", prompt);
 
   const messages: any[] = [
-
     {
       role: "system",
-
-    content: `
+      content: `
 You are an autonomous terminal coding agent.
 
 You work directly on the user's project.
 
 Rules:
-
 - Inspect the project before making changes.
 - Use tools instead of merely describing code.
 - Read relevant files before editing them.
@@ -318,7 +280,6 @@ Rules:
 - Do not claim that you created or modified something unless you actually used a tool to do it.
 
 IMPORTANT FILE MODIFICATION RULES:
-
 - Never overwrite an existing file unless the user explicitly asks you to completely replace it.
 - Before modifying an existing file, always read it first.
 - Use edit_file when modifying an existing file.
@@ -334,7 +295,6 @@ IMPORTANT FILE MODIFICATION RULES:
 - Prefer incremental modifications over replacing complete files.
 
 For every task:
-
 1. Inspect the relevant project files.
 2. Understand the existing implementation.
 3. Make the smallest necessary changes.
@@ -344,184 +304,131 @@ For every task:
 7. Verify the final result.
 `,
     },
-
     {
       role: "user",
       content: prompt,
     },
   ];
 
-
   const maxIterations = 15;
 
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    console.log(
+      `\n[AGENT] Iteration ${iteration + 1}/${maxIterations}`,
+    );
 
-  for (
-    let iteration = 0;
-    iteration < maxIterations;
-    iteration++
-  ) {
-
-    /*
-      Instead of directly calling Groq,
-      we call our retry-enabled function.
-    */
-
-    const response =
-      await callGroqWithRetry(
-        messages
-      );
-
-
-    const message =
-      response.choices[0]?.message;
-
+    const response = await callGroqWithRetry(messages);
+    const message = response.choices[0]?.message;
 
     if (!message) {
-      throw new Error(
-        "Groq returned no message."
-      );
+      throw new Error("Groq returned no message.");
     }
 
-
-    /*
-      Save the assistant message
-      into the conversation.
-    */
-
+    // Preserve the assistant response, including tool-call metadata,
+    // in the conversation sent to Groq on the next iteration.
     messages.push(message);
 
-
-    /*
-      If there are no tool calls,
-      the agent is finished.
-    */
-
-    if (
-      !message.tool_calls ||
-      message.tool_calls.length === 0
-    ) {
-
-      console.log(
-        "\nGroq:\n"
-      );
-
-      console.log(
-        message.content ?? ""
-      );
-
+    if (!message.tool_calls || message.tool_calls.length === 0) {
+      console.log("\nGroq:\n");
+      console.log(message.content ?? "");
+      debugLog("AGENT FINISHED", {
+        iteration: iteration + 1,
+        finishReason: response.choices[0]?.finish_reason,
+      });
       return;
     }
 
-
-    /*
-      Execute every tool requested
-      by the LLM.
-    */
-
-    for (
-      const toolCall of message.tool_calls
-    ) {
-
-      const functionName =
-        toolCall.function.name;
-
-
+    for (const toolCall of message.tool_calls) {
+      const functionName = toolCall.function.name;
       let args: any;
 
-
       try {
+        args = JSON.parse(toolCall.function.arguments);
+      } catch (error: unknown) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
 
-        args = JSON.parse(
-          toolCall.function.arguments
-        );
-
-      } catch {
-
-        args = {};
-      }
-
-
-      let result: unknown;
-
-
-      try {
-
-        result =
-          await executeTool(
-            functionName,
-            args
-          );
-
-      } catch (error: any) {
-
-        /*
-          IMPORTANT:
-
-          The tool itself failed.
-
-          Instead of crashing the agent,
-          we send the error back to the LLM.
-        */
-
-        result = {
-          error:
-            error?.message ??
-            String(error),
-
+        const result = {
+          error: `Invalid JSON tool arguments: ${errorMessage}`,
           is_error: true,
         };
+
+        debugLog("TOOL ARGUMENT PARSE ERROR", {
+          name: functionName,
+          rawArguments: toolCall.function.arguments,
+          error: errorMessage,
+        });
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          name: functionName,
+          content: JSON.stringify(result),
+        });
+
+        continue;
       }
 
+      const toolStartedAt = Date.now();
+      let result: unknown;
 
-      /*
-        Send the tool result back to Groq.
+      debugLog("TOOL EXECUTION STARTED", {
+        id: toolCall.id,
+        name: functionName,
+        arguments: args,
+      });
 
-        Now Groq knows:
+      try {
+        result = await executeTool(functionName, args);
 
-        "I called write_file.
-         It failed because X."
+        debugLog("TOOL RESULT", {
+          id: toolCall.id,
+          name: functionName,
+          durationMs: Date.now() - toolStartedAt,
+          result,
+        });
+      } catch (error: unknown) {
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
 
-        So it can decide what to do next.
-      */
+        result = {
+          error: errorMessage,
+          is_error: true,
+        };
+
+        debugLog("TOOL ERROR", {
+          id: toolCall.id,
+          name: functionName,
+          durationMs: Date.now() - toolStartedAt,
+          error: errorMessage,
+        });
+      }
+
+      // This is the exact result returned to the LLM.
+      const toolResultContent = JSON.stringify(result);
+
+      debugLog("TOOL RESULT SENT TO LLM", {
+        tool_call_id: toolCall.id,
+        name: functionName,
+        content: toolResultContent,
+      });
 
       messages.push({
         role: "tool",
-
-        tool_call_id:
-          toolCall.id,
-
-        name:
-          functionName,
-
-        content:
-          JSON.stringify(result),
+        tool_call_id: toolCall.id,
+        name: functionName,
+        content: toolResultContent,
       });
     }
   }
 
-
-  console.log(
-    "\nAgent stopped: maximum iterations reached."
-  );
+  console.log("\nAgent stopped: maximum iterations reached.");
+  debugLog("AGENT STOPPED", { reason: "maximum iterations reached" });
 }
 
-
-export const agentCommand =
-  new Command("agent")
-
-    .description(
-      "Run the coding agent"
-    )
-
-    .requiredOption(
-      "-p, --prompt <prompt>",
-      "Prompt for the agent"
-    )
-
-    .action(
-      async (options) => {
-        await runAgent(
-          options.prompt
-        );
-      }
-    );
+export const agentCommand = new Command("agent")
+  .description("Run the coding agent")
+  .requiredOption("-p, --prompt <prompt>", "Prompt for the agent")
+  .action(async (options) => {
+    await runAgent(options.prompt);
+  });

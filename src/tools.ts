@@ -1,3 +1,4 @@
+
 import fs from "node:fs/promises";
 import path from "node:path";
 import { exec } from "node:child_process";
@@ -5,27 +6,58 @@ import { promisify } from "node:util";
 
 const execAsync = promisify(exec);
 
-const ROOT = process.cwd();
+// The container's working directory should be /workspace.
+const ROOT = path.resolve(process.env.WORKSPACE ?? process.cwd());
 
-function safePath(filePath: string) {
+function isInsideRoot(fullPath: string): boolean {
+  const relative = path.relative(ROOT, fullPath);
+
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
+// Reject paths outside the workspace and symlinks in the path.
+// This is an additional safeguard, not a substitute for Docker isolation.
+async function safePath(filePath: string): Promise<string> {
   const fullPath = path.resolve(ROOT, filePath);
 
-  if (
-    fullPath !== ROOT &&
-    !fullPath.startsWith(ROOT + path.sep)
-  ) {
+  if (!isInsideRoot(fullPath)) {
     throw new Error("Access denied: path is outside the project");
+  }
+
+  const relative = path.relative(ROOT, fullPath);
+  const parts = relative ? relative.split(path.sep) : [];
+  let current = ROOT;
+
+  for (const part of parts) {
+    current = path.join(current, part);
+
+    try {
+      const stat = await fs.lstat(current);
+
+      if (stat.isSymbolicLink()) {
+        throw new Error(
+          `Access denied: symbolic links are not allowed (${part})`
+        );
+      }
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        // The remaining path may not exist yet (e.g. a new file).
+        break;
+      }
+
+      throw error;
+    }
   }
 
   return fullPath;
 }
 
 export async function listFiles(directory = ".") {
-  const dir = safePath(directory);
-
-  const entries = await fs.readdir(dir, {
-    withFileTypes: true,
-  });
+  const dir = await safePath(directory);
+  const entries = await fs.readdir(dir, { withFileTypes: true });
 
   return entries.map((entry) => ({
     name: entry.name,
@@ -34,44 +66,21 @@ export async function listFiles(directory = ".") {
 }
 
 export async function readFile(filePath: string) {
-  const fullPath = safePath(filePath);
-
-  return await fs.readFile(fullPath, "utf-8");
+  const fullPath = await safePath(filePath);
+  return fs.readFile(fullPath, "utf-8");
 }
 
-export async function writeFile(
-  filePath: string,
-  content: string
-) {
-  const fullPath = safePath(filePath);
+export async function writeFile(filePath: string, content: string) {
+  const fullPath = await safePath(filePath);
 
-  // IMPORTANT:
-  // write_file is now CREATE-ONLY.
-  // It cannot overwrite an existing file.
-  try {
-    await fs.access(fullPath);
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
 
-    throw new Error(
-      `File already exists: ${filePath}. ` +
-      `Use edit_file to modify an existing file instead of write_file.`
-    );
-  } catch (error: any) {
-    // If the file does not exist, fs.access throws ENOENT.
-    // That is the expected case.
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  await fs.mkdir(path.dirname(fullPath), {
-    recursive: true,
+  // "wx" creates a new file and fails if it already exists.
+  // This avoids accidentally overwriting an existing file.
+  await fs.writeFile(fullPath, content, {
+    encoding: "utf-8",
+    flag: "wx",
   });
-
-  await fs.writeFile(
-    fullPath,
-    content,
-    "utf-8"
-  );
 
   return `File created successfully: ${filePath}`;
 }
@@ -81,56 +90,69 @@ export async function editFile(
   oldText: string,
   newText: string
 ) {
-  const fullPath = safePath(filePath);
-
-  const content = await fs.readFile(
-    fullPath,
-    "utf-8"
-  );
+  const fullPath = await safePath(filePath);
+  const content = await fs.readFile(fullPath, "utf-8");
 
   if (!content.includes(oldText)) {
-    throw new Error(
-      `Could not find the specified text in ${filePath}`
-    );
+    throw new Error(`Could not find the specified text in ${filePath}`);
   }
 
-  const updatedContent = content.replace(
-    oldText,
-    newText
-  );
+  const updatedContent = content.replace(oldText, newText);
 
-  await fs.writeFile(
-    fullPath,
-    updatedContent,
-    "utf-8"
-  );
+  await fs.writeFile(fullPath, updatedContent, "utf-8");
 
   return `File edited successfully: ${filePath}`;
 }
 
+
 export async function runCommand(command: string) {
+  const sandboxUrl = process.env.SANDBOX_URL;
+  const token = process.env.SANDBOX_TOKEN;
+
+  if (!sandboxUrl || !token) {
+    return {
+      stdout: "",
+      stderr: "Sandbox is not configured. Check SANDBOX_URL and SANDBOX_TOKEN.",
+      exitCode: 1,
+    };
+  }
+
   try {
-    const { stdout, stderr } = await execAsync(
-      command,
-      {
-        cwd: ROOT,
-        maxBuffer: 10 * 1024 * 1024,
-      }
-    );
+    const response = await fetch(`${sandboxUrl}/run`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ command }),
+      signal: AbortSignal.timeout(35_000),
+    });
+
+    const result = (await response.json()) as {
+      stdout?: string;
+      stderr?: string;
+      exitCode?: number;
+      error?: string;
+    };
+
+    if (!response.ok) {
+      return {
+        stdout: "",
+        stderr: result.error ?? `Sandbox returned HTTP ${response.status}`,
+        exitCode: 1,
+      };
+    }
 
     return {
-      stdout,
-      stderr,
-      exitCode: 0,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      exitCode: result.exitCode ?? 1,
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
     return {
-      stdout: error?.stdout ?? "",
-      stderr:
-        error?.stderr ??
-        error?.message ??
-        String(error),
-      exitCode: error?.code ?? 1,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      exitCode: 1,
     };
   }
 }
